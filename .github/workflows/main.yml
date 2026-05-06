@@ -1,0 +1,62 @@
+name: Build Raspberry Pi 5 Kernel with Module.symvers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout kernel source (official)
+        uses: actions/checkout@v4
+        with:
+          repository: pa3gsb/linux
+          ref: rpi-6.12.y           # ← 请根据实际需求替换为 rpi-6.12.y（若存在）
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison flex libssl-dev make libc6-dev libncurses5-dev \
+            crossbuild-essential-arm64 gcc-aarch64-linux-gnu
+
+      - name: Configure kernel for Pi 5
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2712_defconfig
+
+      - name: Build kernel, dtbs and modules
+        run: |
+          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image.gz dtbs modules
+
+      - name: Create artifacts directory and collect files
+        run: |
+          mkdir -p artifacts/{boot,modules}
+          
+          # 内核镜像与设备树
+          cp arch/arm64/boot/Image.gz artifacts/boot/
+          cp arch/arm64/boot/dts/broadcom/bcm2712-rpi-5-b.dtb artifacts/boot/
+          cp -r arch/arm64/boot/dts/overlays/*.dtbo artifacts/boot/ || true
+          
+          # 关键：复制 Module.symvers
+          cp Module.symvers artifacts/modules/
+          
+          # 安装内核模块到 modules 目录
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+              INSTALL_MOD_PATH=artifacts/modules modules_install
+
+      - name: Upload boot files (Image, DTB, overlays)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi5-kernel-boot
+          path: artifacts/boot/
+
+      - name: Upload modules + Module.symvers
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi5-kernel-modules
+          path: artifacts/modules/
