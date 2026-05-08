@@ -1,4 +1,4 @@
-name: Build Raspberry Pi 5 Kernel and Replace in Official Image
+name: Build Raspberry Pi 5 Kernel with Headers for RadioBerry
 
 on:
   workflow_dispatch:
@@ -20,30 +20,76 @@ jobs:
           submodules: true
           fetch-depth: 0
 
+      - name: Clean up CONFIG_LOCALVERSION in defconfig
+        run: |
+          DEFCONFIG=arch/arm64/configs/bcm2712_defconfig
+          echo "Original first two lines:"
+          head -n 2 "$DEFCONFIG"
+
+          # Remove CONFIG_LOCALVERSION line
+          grep -v "^CONFIG_LOCALVERSION=" "$DEFCONFIG" > "$DEFCONFIG.tmp"
+          
+          # Ensure CONFIG_LOCALVERSION_AUTO is disabled
+          if ! grep -q "^# CONFIG_LOCALVERSION_AUTO is not set$" "$DEFCONFIG.tmp"; then
+            echo "# CONFIG_LOCALVERSION_AUTO is not set" >> "$DEFCONFIG.tmp"
+          fi
+
+          mv "$DEFCONFIG.tmp" "$DEFCONFIG"
+          echo "Modified defconfig (first 5 lines):"
+          head -n 5 "$DEFCONFIG"
+
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y \
             bc bison flex libssl-dev make libc6-dev libncurses5-dev \
             crossbuild-essential-arm64 gcc-aarch64-linux-gnu \
-            xz-utils kpartx
+            xz-utils kpartx rsync
 
-      - name: Configure kernel for Pi 5
+      - name: Configure and build kernel
         run: |
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- bcm2712_defconfig
-
-      - name: Build kernel, dtbs and modules
-        run: |
           make -j$(nproc) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- Image.gz dtbs modules
+          echo $(make ARCH=arm64 kernelrelease) > kernel_version.txt
 
-      - name: Create artifacts directory and collect files
+      - name: Create artifacts (boot, modules, headers)
         run: |
-          mkdir -p artifacts/{boot,modules}
+          KERNEL_VERSION=$(cat kernel_version.txt)
+          echo "Kernel version: $KERNEL_VERSION"
+
+          mkdir -p artifacts/{boot,modules,headers}
+
+          # --- Boot files ---
           cp arch/arm64/boot/Image.gz artifacts/boot/
           cp arch/arm64/boot/dts/broadcom/bcm2712-rpi-5-b.dtb artifacts/boot/
           cp -r arch/arm64/boot/dts/overlays/*.dtbo artifacts/boot/ || true
-          cp Module.symvers artifacts/modules/
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_MOD_PATH=artifacts/modules modules_install
+
+          # --- Modules ---
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+              INSTALL_MOD_PATH=artifacts/modules modules_install
+
+          # --- Headers for DKMS (RadioBerry) ---
+          HEADERS_DIR="artifacts/headers/usr/src/linux-headers-$KERNEL_VERSION"
+          mkdir -p "$HEADERS_DIR"
+
+          # Copy essential files for external module build
+          rsync -a \
+            --include='Makefile' \
+            --include='.config' \
+            --include='Module.symvers' \
+            --include='scripts/***' \
+            --include='include/***' \
+            --include='arch/arm64/Makefile' \
+            --include='arch/arm64/include/***' \
+            --exclude='*' \
+            ./ "$HEADERS_DIR/"
+
+          # Fix permissions for scripts
+          find "$HEADERS_DIR/scripts" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+          # Remove invalid build/source links from modules
+          MODULES_DIR="artifacts/modules/lib/modules/$KERNEL_VERSION"
+          rm -f "$MODULES_DIR/build" "$MODULES_DIR/source"
 
       - name: Download official Raspberry Pi OS image
         run: |
@@ -52,42 +98,48 @@ jobs:
           wget https://downloads.raspberrypi.org/raspios_full_arm64/images/raspios_full_arm64-2026-04-21/2026-04-21-raspios-trixie-arm64-full.img.xz
           xz -d 2026-04-21-raspios-trixie-arm64-full.img.xz
 
-      - name: Mount image partitions and replace kernel
+      - name: Mount image and replace kernel + headers
         run: |
           cd work
+          KERNEL_VERSION=$(cat ../kernel_version.txt)
+          echo "Replacing kernel version: $KERNEL_VERSION"
+
           sudo modprobe loop
-          sudo losetup -f --show 2026-04-21-raspios-trixie-arm64-full.img > loopdev.txt
-          LOOPDEV=$(cat loopdev.txt)
-          sudo partprobe $LOOPDEV
+          LOOPDEV=$(sudo losetup -f --show 2026-04-21-raspios-trixie-arm64-full.img)
+          sudo partprobe "$LOOPDEV"
           sudo mkdir -p /mnt/{boot,root}
 
-          # 挂载 boot (通常为第1个分区)
-          sudo mount ${LOOPDEV}p1 /mnt/boot
-          # 挂载 root (通常为第2个分区)
-          sudo mount ${LOOPDEV}p2 /mnt/root
+          sudo mount "${LOOPDEV}p1" /mnt/boot
+          sudo mount "${LOOPDEV}p2" /mnt/root
 
-          # 替换内核和设备树
+          # Replace boot files
           sudo cp ../artifacts/boot/* /mnt/boot/
 
-          # 替换内核模块（注意：需匹配内核版本）
-          KERNEL_VERSION=$(ls ../artifacts/modules/lib/modules/)
-          sudo rm -rf /mnt/root/lib/modules/$KERNEL_VERSION
-          sudo cp -r ../artifacts/modules/lib/modules/$KERNEL_VERSION /mnt/root/lib/modules/
+          # Replace modules
+          sudo rm -rf "/mnt/root/lib/modules/$KERNEL_VERSION"
+          sudo cp -r "../artifacts/modules/lib/modules/$KERNEL_VERSION" /mnt/root/lib/modules/
 
-          # 可选：复制 Module.symvers 到根目录或 /usr/src（用于后续 dkms 编译）
+          # Install headers
+          sudo mkdir -p /mnt/root/usr/src/
+          sudo cp -r "../artifacts/headers/usr/src/linux-headers-$KERNEL_VERSION" /mnt/root/usr/src/
+
+          # Create correct symlinks
+          sudo ln -sf "/usr/src/linux-headers-$KERNEL_VERSION" "/mnt/root/lib/modules/$KERNEL_VERSION/build"
+          sudo ln -sf "/usr/src/linux-headers-$KERNEL_VERSION" "/mnt/root/lib/modules/$KERNEL_VERSION/source"
+
+          # Optional: copy Module.symvers to root for easy access
           sudo cp ../artifacts/modules/Module.symvers /mnt/root/
 
-          # 清理
           sudo umount /mnt/boot /mnt/root
-          sudo losetup -d $LOOPDEV
+          sudo losetup -d "$LOOPDEV"
 
-      - name: Compress modified image
+      - name: Compress final image
         run: |
           cd work
           xz -9 2026-04-21-raspios-trixie-arm64-full.img
 
-      - name: Upload final image
+      - name: Upload final SD card image
         uses: actions/upload-artifact@v4
         with:
-          name: rpi5-custom-kernel-image
+          name: rpi5-radioberry-ready-image
           path: work/2026-04-21-raspios-trixie-arm64-full.img.xz
