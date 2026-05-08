@@ -1,0 +1,138 @@
+name: Build & Release Custom Raspberry Pi 5 Image
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 仅当推送版本标签时触发发布
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  IMG_NAME: custom-rpi5-os
+  KERNEL_REPO: pa3gsb/linux
+  PI_GEN_REPO: RPi-Distro/pi-gen
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout (not strictly needed, but good practice)
+        uses: actions/checkout@v4
+
+      - name: Install pi-gen dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git wget curl bc bison flex libssl-dev make libc6-dev \
+            libncurses5-dev rsync xz-utils kmod cpio \
+            qemu-user-static debootstrap zerofree \
+            binfmt-support parted dosfstools
+
+      - name: Install cross-compiler for kernel
+        run: |
+          sudo apt install -y gcc-aarch64-linux-gnu
+
+      # =============== 第一步：编译自定义内核 ===============
+      - name: Clone and build custom kernel
+        run: |
+          git clone --depth=1 https://github.com/${{ env.KERNEL_REPO }}.git linux
+          cd linux
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KERNEL=kernel8
+
+          make bcm2712_defconfig
+          make -j$(nproc)
+
+          # 安装模块
+          mkdir -p ../modules
+          INSTALL_MOD_PATH=../modules make modules_install
+
+          # 收集固件文件
+          mkdir -p ../firmware/boot
+          cp arch/arm64/boot/Image ../firmware/boot/$KERNEL.img
+          cp arch/arm64/boot/dts/broadcom/*.dtb ../firmware/boot/
+          mkdir -p ../firmware/boot/overlays
+          cp arch/arm64/boot/dts/overlays/*.dtb* ../firmware/boot/overlays/
+          cp arch/arm64/boot/dts/overlays/README ../firmware/boot/overlays/
+
+          # 获取内核版本（用于后续命名）
+          echo "KERNEL_VERSION=$(make kernelrelease)" >> $GITHUB_ENV
+
+      # =============== 第二步：准备 pi-gen ===============
+      - name: Clone pi-gen
+        run: |
+          git clone --depth=1 https://github.com/${{ env.PI_GEN_REPO }}.git pi-gen
+
+      - name: Configure pi-gen
+        working-directory: pi-gen
+        run: |
+          cat > config <<EOF
+IMG_NAME='${{ env.IMG_NAME }}'
+RELEASE=bookworm
+ENABLE_SSH=1
+WPA_COUNTRY=CN
+EOF
+
+      # =============== 第三步：替换 pi-gen 中的内核 ===============
+      - name: Replace kernel in pi-gen stage1
+        run: |
+          # 清空原有 boot 文件
+          rm -rf pi-gen/stage1/00-boot-files/files/*
+          # 复制新内核和 dtb
+          cp -r firmware/boot/* pi-gen/stage1/00-boot-files/files/
+          # 复制模块（注意：pi-gen 会自动处理 /lib/modules）
+          cp -r modules/lib/modules/* pi-gen/stage1/01-sys-tweaks/files/lib/modules/
+
+      # =============== 第四步：构建镜像 ===============
+      - name: Build image with pi-gen
+        working-directory: pi-gen
+        run: |
+          sudo ./build.sh
+
+      # =============== 第五步：找到并压缩镜像 ===============
+      - name: Locate and compress image
+        id: find_image
+        run: |
+          # pi-gen 输出路径: ./work/${IMG_NAME}/export-image/*.img
+          IMG_PATH=$(find ./pi-gen/work -name "${{ env.IMG_NAME }}*.img" | head -n1)
+          if [ -z "$IMG_PATH" ]; then
+            echo "Error: Image not found!"
+            exit 1
+          fi
+          echo "Found image: $IMG_PATH"
+          xz -9 -T0 "$IMG_PATH"
+          COMPRESSED_IMG="${IMG_PATH}.xz"
+          echo "COMPRESSED_IMG=$COMPRESSED_IMG" >> $GITHUB_OUTPUT
+          echo "IMG_BASENAME=$(basename "$COMPRESSED_IMG")" >> $GITHUB_OUTPUT
+
+      # =============== 第六步：创建 GitHub Release 并上传 ===============
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: ${{ steps.find_image.outputs.COMPRESSED_IMG }}
+          body: |
+            Custom Raspberry Pi 5 OS image with kernel from [${{ env.KERNEL_REPO }}](https://github.com/${{ env.KERNEL_REPO }}).
+
+            Kernel version: ${{ env.KERNEL_VERSION }}
+
+            Built on: ${{ fromUnixTime(steps.current-time.outputs.unix) }}
+
+            Includes SSH enabled by default.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current time
+        id: current-time
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const now = new Date().toISOString();
+            core.setOutput('unix', Math.floor(new Date(now).getTime() / 1000));
