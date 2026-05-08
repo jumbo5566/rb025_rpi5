@@ -76,11 +76,11 @@ jobs:
         working-directory: pi-gen
         run: |
           cat > config <<EOF
-IMG_NAME='${{ env.IMG_NAME }}'
-RELEASE=bookworm
-ENABLE_SSH=1
-WPA_COUNTRY=US
-EOF
+          IMG_NAME='${{ env.IMG_NAME }}'
+          RELEASE=trixie
+          ENABLE_SSH=1
+          WPA_COUNTRY=US
+          EOF
 
       # =============== 第三步：替换内核和模块 ===============
       - name: Replace kernel in pi-gen stage1
