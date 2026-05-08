@@ -20,15 +20,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies for pi-gen and kernel build
+      - name: Install and enable QEMU binfmt for multiarch
         run: |
           sudo apt update
           sudo apt install -y \
             git wget curl bc bison flex libssl-dev make libc6-dev \
             libncurses5-dev rsync xz-utils kmod cpio \
-            qemu-user-static debootstrap zerofree \
-            binfmt-support parted dosfstools \
-            gcc-aarch64-linux-gnu
+            debootstrap zerofree parted dosfstools \
+            gcc-aarch64-linux-gnu \
+            qemu-user-static binfmt-support libarchive-tools
+
+          # Enable ARM64 emulation
+          sudo systemctl restart systemd-binfmt
+          sudo update-binfmts --enable qemu-aarch64
+
+          # Verify
+          echo "Checking binfmt:"
+          ls /proc/sys/fs/binfmt_misc/qemu-aarch64 && echo "✅ qemu-aarch64 enabled" || echo "❌ NOT ENABLED"
+          command -v bsdtar && echo "✅ bsdtar available" || echo "❌ bsdtar missing"
 
       # =============== 第一步：编译自定义内核 ===============
       - name: Clone and build custom kernel
@@ -67,12 +76,11 @@ jobs:
         working-directory: pi-gen
         run: |
           cat > config <<EOF
-          IMG_NAME='rpi5'
-          RELEASE=trixie
-          TARGET_HOSTNAME='radioberry'
-          ENABLE_SSH=1
-          WPA_COUNTRY=US
-          EOF
+IMG_NAME='${{ env.IMG_NAME }}'
+RELEASE=bookworm
+ENABLE_SSH=1
+WPA_COUNTRY=US
+EOF
 
       # =============== 第三步：替换内核和模块 ===============
       - name: Replace kernel in pi-gen stage1
