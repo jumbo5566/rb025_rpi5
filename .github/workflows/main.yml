@@ -128,7 +128,7 @@ jobs:
           sudo ln -sf "/usr/src/linux-headers-$KERNEL_VERSION" "/mnt/root/lib/modules/$KERNEL_VERSION/source"
 
           # Optional: copy Module.symvers to root for easy access
-          sudo cp ../artifacts/modules/Module.symvers /mnt/root/
+          sudo cp ../Module.symvers /mnt/root/
 
           sudo umount /mnt/boot /mnt/root
           sudo losetup -d "$LOOPDEV"
