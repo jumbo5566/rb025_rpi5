@@ -135,7 +135,7 @@ jobs:
             Built with custom kernel from [${{ env.KERNEL_REPO }}](https://github.com/${{ env.KERNEL_REPO }}).
 
             - Kernel: ${{ env.KERNEL_VERSION }}
-            - Base: Raspberry Pi OS Bookworm
+            - Base: Raspberry Pi OS trixie
             - SSH enabled
 
             Download and decompress:
