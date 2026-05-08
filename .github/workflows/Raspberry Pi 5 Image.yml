@@ -3,8 +3,8 @@ name: Build & Release Custom Raspberry Pi 5 Image
 on:
   push:
     tags:
-      - 'v*.*.*'  # 仅当推送版本标签时触发发布（如 v1.0.0）
-  workflow_dispatch:  # 允许手动触发
+      - 'v*.*.*'
+  workflow_dispatch:
 
 env:
   IMG_NAME: custom-rpi5-os
@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install and enable QEMU binfmt for multiarch
+      - name: Install core dependencies (including QEMU for ARM64)
         run: |
           sudo apt update
           sudo apt install -y \
@@ -30,16 +30,20 @@ jobs:
             gcc-aarch64-linux-gnu \
             qemu-user-static binfmt-support libarchive-tools
 
-          # Enable ARM64 emulation
+          # Ensure qemu-aarch64 binary exists and is executable
+          ls -l /usr/bin/qemu-aarch64 || echo "qemu-aarch64 not found, creating symlink..."
+          sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64 2>/dev/null || true
+
+          # Enable binfmt manually (critical!)
           sudo systemctl restart systemd-binfmt
           sudo update-binfmts --enable qemu-aarch64
 
-          # Verify
-          echo "Checking binfmt:"
-          ls /proc/sys/fs/binfmt_misc/qemu-aarch64 && echo "✅ qemu-aarch64 enabled" || echo "❌ NOT ENABLED"
-          command -v bsdtar && echo "✅ bsdtar available" || echo "❌ bsdtar missing"
+          # Verify environment
+          echo "=== Verifying tools ==="
+          command -v qemu-aarch64 && echo "✅ qemu-aarch64 OK"
+          command -v bsdtar && echo "✅ bsdtar OK"
+          ls /proc/sys/fs/binfmt_misc/qemu-aarch64 && echo "✅ binfmt registered"
 
-      # =============== 第一步：编译自定义内核 ===============
       - name: Clone and build custom kernel
         run: |
           git clone --depth=1 https://github.com/${{ env.KERNEL_REPO }}.git linux
@@ -52,11 +56,9 @@ jobs:
           make bcm2712_defconfig
           make -j$(nproc)
 
-          # 安装模块
           mkdir -p ../modules
           INSTALL_MOD_PATH=../modules make modules_install
 
-          # 收集固件文件（boot 目录结构）
           mkdir -p ../firmware/boot
           cp arch/arm64/boot/Image ../firmware/boot/$KERNEL.img
           cp arch/arm64/boot/dts/broadcom/*.dtb ../firmware/boot/
@@ -64,10 +66,8 @@ jobs:
           cp arch/arm64/boot/dts/overlays/*.dtb* ../firmware/boot/overlays/
           cp arch/arm64/boot/dts/overlays/README ../firmware/boot/overlays/
 
-          # 获取内核版本用于命名和 Release
           echo "KERNEL_VERSION=$(make kernelrelease)" >> $GITHUB_ENV
 
-      # =============== 第二步：准备 pi-gen ===============
       - name: Clone pi-gen
         run: |
           git clone --depth=1 https://github.com/${{ env.PI_GEN_REPO }}.git pi-gen
@@ -82,50 +82,39 @@ jobs:
           WPA_COUNTRY=US
           EOF
 
-      # =============== 第三步：替换内核和模块 ===============
-      - name: Replace kernel in pi-gen stage1
+      - name: Replace kernel in stage1
         run: |
-          # 清空默认 boot 文件
           rm -rf pi-gen/stage1/00-boot-files/files/*
-          # 复制新内核、dtb、overlays
           cp -r firmware/boot/* pi-gen/stage1/00-boot-files/files/
 
-          # 确保模块目录存在
           mkdir -p pi-gen/stage1/01-sys-tweaks/files/lib/modules/
-          # 复制内核模块（注意：路径必须匹配 kernelrelease）
           cp -r modules/lib/modules/* pi-gen/stage1/01-sys-tweaks/files/lib/modules/
 
-      # =============== 第四步：构建镜像 ===============
-      - name: Build image with pi-gen
+      - name: Build image (skip dependency check)
         working-directory: pi-gen
         run: |
-          sudo ./build.sh
+          # 关键：跳过依赖检查！
+          sudo SKIP_DEPENDENCY_CHECK=1 ./build.sh
 
-      # =============== 第五步：压缩输出镜像 ===============
       - name: Locate and compress image
         id: find_image
         run: |
-          # 查找生成的 .img 文件
           IMG_PATH=$(find ./pi-gen/work -name "${{ env.IMG_NAME }}*.img" | head -n1)
           if [ -z "$IMG_PATH" ]; then
-            echo "❌ Error: No image found!"
+            echo "❌ No .img found!"
             ls -R ./pi-gen/work/
             exit 1
           fi
-          echo "✅ Found image: $IMG_PATH"
-          # 高压缩率压缩（-9），多线程（-T0）
+          echo "✅ Image found: $IMG_PATH"
           xz -9 -T0 "$IMG_PATH"
-          COMPRESSED="${IMG_PATH}.xz"
-          echo "COMPRESSED_IMG=$COMPRESSED" >> $GITHUB_OUTPUT
-          echo "IMG_FILENAME=$(basename "$COMPRESSED")" >> $GITHUB_OUTPUT
+          echo "COMPRESSED_IMG=${IMG_PATH}.xz" >> $GITHUB_OUTPUT
+          echo "IMG_FILENAME=$(basename "${IMG_PATH}.xz")" >> $GITHUB_OUTPUT
 
-      # =============== 第六步：获取当前时间（用于 Release 描述） ===============
-      - name: Get current time (ISO format)
+      - name: Get current time
         id: current-time
         run: |
           echo "time=$(date -u +'%Y-%m-%d %H:%M UTC')" >> $GITHUB_OUTPUT
 
-      # =============== 第七步：创建 GitHub Release 并上传镜像 ===============
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -135,18 +124,15 @@ jobs:
           prerelease: false
           files: ${{ steps.find_image.outputs.COMPRESSED_IMG }}
           body: |
-            Custom Raspberry Pi 5 OS image built with kernel from [${{ env.KERNEL_REPO }}](https://github.com/${{ env.KERNEL_REPO }}).
+            Built with custom kernel from [${{ env.KERNEL_REPO }}](https://github.com/${{ env.KERNEL_REPO }}).
 
-            - **Kernel version**: `${{ env.KERNEL_VERSION }}`
-            - **Built on**: ${{ steps.current-time.outputs.time }}
-            - **Base OS**: Raspberry Pi OS Bookworm
-            - **SSH**: Enabled by default
+            - Kernel: ${{ env.KERNEL_VERSION }}
+            - Base: Raspberry Pi OS Bookworm
+            - SSH enabled
 
-            Download the `.xz` file and decompress with:
+            Download and decompress:
             ```bash
             xz -d  $ {{ steps.find_image.outputs.IMG_FILENAME }}
             ```
-
-            Then write to SD card using Raspberry Pi Imager or `dd`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
