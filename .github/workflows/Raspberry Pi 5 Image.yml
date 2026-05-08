@@ -94,7 +94,7 @@ jobs:
         working-directory: pi-gen
         run: |
           # 关键：跳过依赖检查！
-          sudo SKIP_DEPENDENCY_CHECK=1 ./build.sh
+          sudo env SKIP_DEPENDENCY_CHECK=1 ./build.sh
 
       - name: Locate and compress image
         id: find_image
