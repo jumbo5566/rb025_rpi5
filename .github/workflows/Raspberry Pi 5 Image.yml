@@ -31,26 +31,45 @@ jobs:
             qemu-user-static binfmt-support libarchive-tools
 
           # Ensure qemu-aarch64 binary exists and is executable
-          # 1. 确保静态版存在
           if [ ! -f /usr/bin/qemu-aarch64-static ]; then
             echo "ERROR: qemu-aarch64-static not found!" >&2
             exit 1
           fi
 
-          # 2. 强制创建符号链接（覆盖可能存在的坏链接）
+          # Create the symlink
           sudo rm -f /usr/bin/qemu-aarch64
           sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64
           echo "✅ Created symlink: qemu-aarch64 → qemu-aarch64-static"
 
-          # 3. 刷新 hash 缓存（关键！否则 build.sh 仍找不到）
-          hash -r
-          command -v qemu-aarch64 && echo "✓ qemu-aarch64 found" || echo "✗ NOT FOUND"
-
-          # Enable binfmt manually (critical!)
+          # Enable binfmt
           sudo systemctl restart systemd-binfmt
           sudo update-binfmts --enable qemu-aarch64
 
-          # Verify environment
+          # === 强化验证：不仅仅是路径存在，还要能执行！===
+          echo "=== Verifying QEMU functionality ==="
+          
+          # 1. Create a simple aarch64 test program
+          echo '#include <stdio.h>
+                int main() { printf("QEMU works!\\n"); return 0; }' > test.c
+          
+          # 2. Cross-compile it
+          aarch64-linux-gnu-gcc -o test-aarch64 test.c
+          
+          # 3. Try to run it (this triggers binfmt + qemu)
+          if timeout 10s ./test-aarch64; then
+            echo "✅ QEMU aarch64 emulation is WORKING!"
+          else
+            echo "❌ QEMU aarch64 emulation FAILED!" >&2
+            echo "Contents of /proc/sys/fs/binfmt_misc/:"
+            ls -l /proc/sys/fs/binfmt_misc/
+            echo "Status of systemd-binfmt:"
+            systemctl status systemd-binfmt --no-pager
+            exit 1
+          fi
+          
+          rm -f test.c test-aarch64
+
+          # Final tool check
           echo "=== Verifying tools ==="
           command -v qemu-aarch64 && echo "✅ qemu-aarch64 OK"
           command -v bsdtar && echo "✅ bsdtar OK"
@@ -84,13 +103,19 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/${{ env.PI_GEN_REPO }}.git pi-gen
           
-      # 🔥 关键修复：覆盖 dependencies.sh 为无操作脚本（绕过所有 stage 的依赖检查）
-      - name: Disable all dependency checks
+      # ✅ 关键修复：精准修改 depends 文件以适配 Ubuntu
+      - name: Fix pi-gen dependencies for Ubuntu
         working-directory: pi-gen
         run: |
-          echo '#!/bin/bash' > scripts/dependencies.sh
-          chmod +x scripts/dependencies.sh
-          echo "✅ dependencies.sh replaced with empty script"
+          # Backup original file
+          cp depends depends.bak
+          
+          # Apply precise fixes
+          sed -i 's/qemu-arm:qemu-user-binfmt/qemu-arm-static:qemu-user-static/g' depends
+          sed -i 's/^arch-test/# arch-test (skipped for Ubuntu)/g' depends
+          
+          echo "✅ Modified 'depends' file for Ubuntu compatibility"
+          cat depends
 
       - name: Configure pi-gen
         working-directory: pi-gen
@@ -110,11 +135,11 @@ jobs:
           mkdir -p pi-gen/stage1/01-sys-tweaks/files/lib/modules/
           cp -r modules/lib/modules/* pi-gen/stage1/01-sys-tweaks/files/lib/modules/
 
-      - name: Build image (skip dependency check)
+      - name: Build image
         working-directory: pi-gen
         run: |
-          # 关键：跳过依赖检查！
-          sudo env SKIP_DEPENDENCY_CHECK=1 ./build.sh
+          # No need for SKIP_DEPENDENCY_CHECK anymore!
+          sudo ./build.sh
 
       - name: Locate and compress image
         id: find_image
