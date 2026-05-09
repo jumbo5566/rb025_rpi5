@@ -9,7 +9,7 @@ on:
 env:
   IMG_NAME: custom-rpi5-os
   KERNEL_REPO: pa3gsb/linux
-  PI_GEN_REPO: RPi-Distro/pi-gen
+  PI_GEN_REPO: jumbo5566/pi-gen
 
 jobs:
   build-image:
@@ -31,8 +31,20 @@ jobs:
             qemu-user-static binfmt-support libarchive-tools
 
           # Ensure qemu-aarch64 binary exists and is executable
-          ls -l /usr/bin/qemu-aarch64 || echo "qemu-aarch64 not found, creating symlink..."
-          sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64 2>/dev/null || true
+          # 1. 确保静态版存在
+          if [ ! -f /usr/bin/qemu-aarch64-static ]; then
+            echo "ERROR: qemu-aarch64-static not found!" >&2
+            exit 1
+          fi
+
+          # 2. 强制创建符号链接（覆盖可能存在的坏链接）
+          sudo rm -f /usr/bin/qemu-aarch64
+          sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64
+          echo "✅ Created symlink: qemu-aarch64 → qemu-aarch64-static"
+
+          # 3. 刷新 hash 缓存（关键！否则 build.sh 仍找不到）
+          hash -r
+          command -v qemu-aarch64 && echo "✓ qemu-aarch64 found" || echo "✗ NOT FOUND"
 
           # Enable binfmt manually (critical!)
           sudo systemctl restart systemd-binfmt
