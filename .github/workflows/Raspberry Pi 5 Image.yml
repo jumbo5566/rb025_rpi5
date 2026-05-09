@@ -30,13 +30,13 @@ jobs:
             gcc-aarch64-linux-gnu \
             qemu-user-static binfmt-support libarchive-tools
 
-          # Ensure qemu-aarch64 binary exists and is executable
+          # Verify qemu-aarch64-static exists
           if [ ! -f /usr/bin/qemu-aarch64-static ]; then
             echo "ERROR: qemu-aarch64-static not found!" >&2
             exit 1
           fi
 
-          # Create the symlink
+          # Create symlink for compatibility
           sudo rm -f /usr/bin/qemu-aarch64
           sudo ln -sf /usr/bin/qemu-aarch64-static /usr/bin/qemu-aarch64
           echo "✅ Created symlink: qemu-aarch64 → qemu-aarch64-static"
@@ -45,35 +45,32 @@ jobs:
           sudo systemctl restart systemd-binfmt
           sudo update-binfmts --enable qemu-aarch64
 
-          # === 强化验证：不仅仅是路径存在，还要能执行！===
-          echo "=== Verifying QEMU functionality ==="
+          # === CRITICAL FIX: Verify with STATICALLY LINKED binary ===
+          echo "=== Verifying QEMU with static aarch64 binary ==="
           
-          # 1. Create a simple aarch64 test program
+          # Compile a statically linked test program
           echo '#include <stdio.h>
                 int main() { printf("QEMU works!\\n"); return 0; }' > test.c
+          aarch64-linux-gnu-gcc -static -o test-aarch64 test.c
           
-          # 2. Cross-compile it
-          aarch64-linux-gnu-gcc -o test-aarch64 test.c
-          
-          # 3. Try to run it (this triggers binfmt + qemu)
+          # Run it — this must succeed for pi-gen to work
           if timeout 10s ./test-aarch64; then
-            echo "✅ QEMU aarch64 emulation is WORKING!"
+            echo "✅ SUCCESS: QEMU aarch64 emulation is fully functional!"
           else
-            echo "❌ QEMU aarch64 emulation FAILED!" >&2
-            echo "Contents of /proc/sys/fs/binfmt_misc/:"
+            echo "❌ FAILURE: QEMU emulation failed (static binary test)" >&2
             ls -l /proc/sys/fs/binfmt_misc/
-            echo "Status of systemd-binfmt:"
             systemctl status systemd-binfmt --no-pager
+            cat /proc/sys/fs/binfmt_misc/qemu-aarch64 || true
             exit 1
           fi
           
           rm -f test.c test-aarch64
 
-          # Final tool check
-          echo "=== Verifying tools ==="
-          command -v qemu-aarch64 && echo "✅ qemu-aarch64 OK"
-          command -v bsdtar && echo "✅ bsdtar OK"
-          ls /proc/sys/fs/binfmt_misc/qemu-aarch64 && echo "✅ binfmt registered"
+          # Final sanity checks
+          echo "=== Final tool check ==="
+          command -v qemu-aarch64 && echo "✓ qemu-aarch64 OK"
+          command -v bsdtar && echo "✓ bsdtar OK"
+          [ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ] && echo "✓ binfmt registered" || echo "✗ binfmt NOT registered"
 
       - name: Clone and build custom kernel
         run: |
@@ -102,19 +99,15 @@ jobs:
       - name: Clone pi-gen
         run: |
           git clone --depth=1 https://github.com/${{ env.PI_GEN_REPO }}.git pi-gen
-          
-      # ✅ 关键修复：精准修改 depends 文件以适配 Ubuntu
+
+      # ✅ Fix dependencies for Ubuntu (precise, not disabling)
       - name: Fix pi-gen dependencies for Ubuntu
         working-directory: pi-gen
         run: |
-          # Backup original file
           cp depends depends.bak
-          
-          # Apply precise fixes
           sed -i 's/qemu-arm:qemu-user-binfmt/qemu-arm-static:qemu-user-static/g' depends
           sed -i 's/^arch-test/# arch-test (skipped for Ubuntu)/g' depends
-          
-          echo "✅ Modified 'depends' file for Ubuntu compatibility"
+          echo "✅ Fixed 'depends' file"
           cat depends
 
       - name: Configure pi-gen
@@ -138,7 +131,7 @@ jobs:
       - name: Build image
         working-directory: pi-gen
         run: |
-          # No need for SKIP_DEPENDENCY_CHECK anymore!
+          # No SKIP_DEPENDENCY_CHECK needed — our fixes are in place
           sudo ./build.sh
 
       - name: Locate and compress image
@@ -147,7 +140,7 @@ jobs:
           IMG_PATH=$(find ./pi-gen/work -name "${{ env.IMG_NAME }}*.img" | head -n1)
           if [ -z "$IMG_PATH" ]; then
             echo "❌ No .img found!"
-            ls -R ./pi-gen/work/
+            ls -R ./pi-gen/work/ || true
             exit 1
           fi
           echo "✅ Image found: $IMG_PATH"
